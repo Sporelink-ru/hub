@@ -1,0 +1,17 @@
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.dll
+*.exe
+*.pdb
+artifacts/
+appsettings.Development.json
+appsettings.Local.json
+*.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.env.example

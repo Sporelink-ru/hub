@@ -8,22 +8,23 @@ using Stj = System.Text.Json;
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
+// ─── Config from env ─────────────────────────────────────────────────
+var serverId   = Environment.GetEnvironmentVariable("SPORELINK_SERVER_ID")   ?? "hub-0001";
+var serverName = Environment.GetEnvironmentVariable("SPORELINK_SERVER_NAME") ?? "Sporelink Hub";
+var baseUrl    = Environment.GetEnvironmentVariable("SPORELINK_BASE_URL")    ?? "http://localhost:5000";
+var peersRaw   = Environment.GetEnvironmentVariable("SPORELINK_PEERS")       ?? "";
+var peers = peersRaw
+    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
 // ─── Keys ────────────────────────────────────────────────────────────
-// Ed25519 key. In prod: load from secrets, never generate on start.
 var signingKey = Key.Create(
     SignatureAlgorithm.Ed25519,
     new KeyCreationParameters { ExportPolicy = KeyExportPolicies.AllowPlaintextExport });
 var publicKeyB64 = Convert.ToBase64String(
     signingKey.PublicKey.Export(KeyBlobFormat.RawPublicKey));
-
-var serverId = "hub-0001";
-var baseUrl = "http://localhost:5000";
-
-// MVP: same key signs manifests and JWTs. Split into authKey in v0.3.
 var authKey = signingKey;
 
-// ─── In-memory user store ────────────────────────────────────────────
-// MVP ONLY. Replace SHA256 with BCrypt before any public launch.
+// ─── Users ───────────────────────────────────────────────────────────
 var users = new Dictionary<string, (string PasswordHash, string Uuid, string Name)>
 {
     ["alice"] = (
@@ -32,13 +33,94 @@ var users = new Dictionary<string, (string PasswordHash, string Uuid, string Nam
         "Alice"
     )
 };
+if (serverId == "hub-0002")
+{
+    users["bob"] = (
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("password"))),
+        "a1b2000000000000000000000000c3d2",
+        "Bob"
+    );
+}
+
+// ─── Peer manifest cache ─────────────────────────────────────────────
+var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+var peerCache = new Dictionary<string, JObject>();
+var cacheLock = new object();
+
+async Task<JObject?> FetchPeerManifestAsync(string peerUrl)
+{
+    try
+    {
+        // 1. Peer's well-known
+        var wkBody = await httpClient.GetStringAsync(
+            peerUrl.TrimEnd('/') + "/.well-known/mc-federation");
+        var wk = JObject.Parse(wkBody);
+        var peerPubKeyB64 = wk["public_keys"]!["server_signing_key"]!
+            .ToString().Replace("ed25519:", "");
+
+        // 2. Peer's manifest
+        var mfBody = await httpClient.GetStringAsync(
+            peerUrl.TrimEnd('/') + "/federation/manifest");
+        var mf = JObject.Parse(mfBody);
+
+        // 3. Verify signature
+        var signatures = mf["signatures"] as JArray;
+        if (signatures == null || signatures.Count == 0) return null;
+        var sigB64 = signatures[0]!["sig"]!.ToString();
+
+        var toSign = (JObject)mf.DeepClone();
+        toSign.Remove("signatures");
+        var canonical    = Canonicalize(toSign);
+        var signingInput = "SPORELINK-MANIFEST-V1\n" + canonical;
+
+        var peerPub = PublicKey.Import(
+            SignatureAlgorithm.Ed25519,
+            Convert.FromBase64String(peerPubKeyB64),
+            KeyBlobFormat.RawPublicKey);
+        var ok = SignatureAlgorithm.Ed25519.Verify(
+            peerPub,
+            Encoding.UTF8.GetBytes(signingInput),
+            Convert.FromBase64String(sigB64));
+        if (!ok) return null;
+
+        return mf;
+    }
+    catch
+    {
+        return null;
+    }
+}
+
+// Background refresh: no HTTP calls from request path → no deadlock.
+_ = Task.Run(async () =>
+{
+    while (true)
+    {
+        bool allOk = true;
+        foreach (var peer in peers)
+        {
+            var mf = await FetchPeerManifestAsync(peer);
+            if (mf != null)
+            {
+                lock (cacheLock) { peerCache[peer] = mf; }
+            }
+            else
+            {
+                allOk = false;
+            }
+        }
+        await Task.Delay(allOk
+            ? TimeSpan.FromSeconds(15)
+            : TimeSpan.FromSeconds(2));
+    }
+});
 
 // ─── Discovery ───────────────────────────────────────────────────────
 app.MapGet("/.well-known/mc-federation", () => new
 {
     protocol_version = "0.1",
     server_id = serverId,
-    server_name = "Sporelink Hub",
+    server_name = serverName,
     auth_homeserver = baseUrl,
     public_keys = new
     {
@@ -48,23 +130,41 @@ app.MapGet("/.well-known/mc-federation", () => new
     capabilities = new[] { "discovery", "manifest", "auth" }
 });
 
-// ─── Signed manifest ─────────────────────────────────────────────────
+// ─── Aggregated signed manifest ──────────────────────────────────────
 app.MapGet("/federation/manifest", () =>
 {
+    var membersById = new Dictionary<string, JObject>
+    {
+        [serverId] = new JObject
+        {
+            ["server_id"] = serverId,
+            ["endpoint"] = baseUrl,
+            ["public_key"] = "ed25519:" + publicKeyB64
+        }
+    };
+
+    // Add members from cached peer manifests (read-only, no HTTP)
+    lock (cacheLock)
+    {
+        foreach (var peerMf in peerCache.Values)
+        {
+            if (peerMf["members"] is not JArray arr) continue;
+            foreach (var m in arr)
+            {
+                var id = m!["server_id"]?.ToString();
+                if (string.IsNullOrEmpty(id)) continue;
+                if (!membersById.ContainsKey(id))
+                    membersById[id] = (JObject)m.DeepClone();
+            }
+        }
+    }
+
     var body = new JObject
     {
         ["manifest_version"] = "0.1",
         ["federation_id"] = "sporelink",
         ["issued_at"] = DateTime.UtcNow.ToString("O"),
-        ["members"] = new JArray
-        {
-            new JObject
-            {
-                ["server_id"] = serverId,
-                ["endpoint"] = baseUrl,
-                ["public_key"] = "ed25519:" + publicKeyB64
-            }
-        },
+        ["members"] = new JArray(membersById.Values.ToArray()),
         ["rules"] = new JObject
         {
             ["min_reputation_to_join"] = 0,
@@ -72,7 +172,7 @@ app.MapGet("/federation/manifest", () =>
         }
     };
 
-    var canonical = Canonicalize(body);
+    var canonical    = Canonicalize(body);
     var signingInput = "SPORELINK-MANIFEST-V1\n" + canonical;
     var sig = SignatureAlgorithm.Ed25519.Sign(
         signingKey, Encoding.UTF8.GetBytes(signingInput));
@@ -93,31 +193,17 @@ app.MapGet("/federation/manifest", () =>
 app.MapPost("/authserver/authenticate", (LoginRequest req) =>
 {
     if (!users.TryGetValue(req.Username, out var user))
-    {
-        return Results.Json(
-            new
-            {
-                error = "ForbiddenOperationException",
-                errorMessage = "Invalid credentials"
-            },
-            statusCode: 403);
-    }
+        return Results.Json(new { error = "ForbiddenOperationException",
+                                  errorMessage = "Invalid credentials" }, statusCode: 403);
 
     var hash = Convert.ToHexString(
         SHA256.HashData(Encoding.UTF8.GetBytes(req.Password)));
     if (hash != user.PasswordHash)
-    {
-        return Results.Json(
-            new
-            {
-                error = "ForbiddenOperationException",
-                errorMessage = "Invalid credentials"
-            },
-            statusCode: 403);
-    }
+        return Results.Json(new { error = "ForbiddenOperationException",
+                                  errorMessage = "Invalid credentials" }, statusCode: 403);
 
     var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-    var header = new { alg = "EdDSA", typ = "JWT", kid = serverId };
+    var header  = new { alg = "EdDSA", typ = "JWT", kid = serverId };
     var payload = new
     {
         iss = serverId,
@@ -138,22 +224,16 @@ app.MapPost("/authserver/authenticate", (LoginRequest req) =>
 
     return Results.Json(new
     {
-        accessToken       = jwt,
-        clientToken       = req.ClientToken ?? Guid.NewGuid().ToString("N"),
-        availableProfiles = new[]
-        {
-            new { id = user.Uuid, name = user.Name }
-        },
-        selectedProfile   = new { id = user.Uuid, name = user.Name }
+        accessToken = jwt,
+        clientToken = req.ClientToken ?? Guid.NewGuid().ToString("N"),
+        availableProfiles = new[] { new { id = user.Uuid, name = user.Name } },
+        selectedProfile = new { id = user.Uuid, name = user.Name }
     });
 });
 
 app.Run();
 
 // ─── Helpers ─────────────────────────────────────────────────────────
-
-// Simplified JCS: recursive key sorting, no whitespace.
-// For v0.2, swap for a proper RFC 8785 library on both sides.
 static string Canonicalize(JToken token) =>
     token switch
     {
@@ -173,5 +253,4 @@ static string Base64UrlEncode(byte[] bytes) =>
         .Replace('+', '-')
         .Replace('/', '_');
 
-// ─── DTOs ────────────────────────────────────────────────────────────
 internal record LoginRequest(string Username, string Password, string? ClientToken);

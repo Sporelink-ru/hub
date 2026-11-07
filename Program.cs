@@ -1,406 +1,510 @@
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
+using Microsoft.EntityFrameworkCore;
 using NSec.Cryptography;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using Sporelink.Hub.Data;
+using Sporelink.Hub.Models;
 using Stj = System.Text.Json;
 
-var builder = WebApplication.CreateBuilder(args);
-var app = builder.Build();
+namespace Sporelink.Hub;
 
-// ─── Config from env ─────────────────────────────────────────────────
-var serverId   = Environment.GetEnvironmentVariable("SPORELINK_SERVER_ID")   ?? "hub-0001";
-var serverName = Environment.GetEnvironmentVariable("SPORELINK_SERVER_NAME") ?? "Sporelink Hub";
-var baseUrl    = Environment.GetEnvironmentVariable("SPORELINK_BASE_URL")    ?? "http://localhost:5000";
-var peersRaw   = Environment.GetEnvironmentVariable("SPORELINK_PEERS")       ?? "";
-var peers = peersRaw
-    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-
-// ─── Keys ────────────────────────────────────────────────────────────
-var signingKey = Key.Create(
-    SignatureAlgorithm.Ed25519,
-    new KeyCreationParameters { ExportPolicy = KeyExportPolicies.AllowPlaintextExport });
-var publicKeyB64 = Convert.ToBase64String(
-    signingKey.PublicKey.Export(KeyBlobFormat.RawPublicKey));
-var authKey = signingKey;
-
-// ─── Users with reputation and roles ─────────────────────────────────
-var users = new Dictionary<string, UserRecord>
+public class Program
 {
-    ["alice"] = new UserRecord(
-        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("password"))),
-        "8f3a000000000000000000000000c2e1",
-        "Alice",
-        42,
-        new[] { "player", "creator" }
-    )
-};
-// Хранилище активных сессий: serverId -> username
-var joinedSessions = new System.Collections.Concurrent.ConcurrentDictionary<string, string>();
-if (serverId == "hub-0002")
-{
-    users["bob"] = new UserRecord(
-        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("password"))),
-        "a1b2000000000000000000000000c3d2",
-        "Bob",
-        -5,
-        new[] { "player" }
-    );
-}
+    // ─── State ───────────────────────────────────────────────────────────
+    private static string _serverId = "";
+    private static string _baseUrl = "";
+    private static string _dataDir = "";
+    
+    private static Key _signingKey = null!;
+    private static string _publicKeyB64 = "";
+    private static RSA _rsaKey = null!;
+    
+    private static ConcurrentDictionary<string, string> _joinedSessions = new();
+    private static Dictionary<string, JObject> _peerCache = new();
+    private static readonly object CacheLock = new();
 
-// ─── Peer manifest cache ─────────────────────────────────────────────
-var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
-var peerCache = new Dictionary<string, JObject>();
-var cacheLock = new object();
-
-async Task<JObject?> FetchPeerManifestAsync(string peerUrl)
-{
-    try
+    public static void Main(string[] args)
     {
-        // 1. Peer's well-known
-        var wkBody = await httpClient.GetStringAsync(
-            peerUrl.TrimEnd('/') + "/.well-known/mc-federation");
-        var wk = JObject.Parse(wkBody);
-        var peerPubKeyB64 = wk["public_keys"]!["server_signing_key"]!
-            .ToString().Replace("ed25519:", "");
+        var builder = WebApplication.CreateBuilder(args);
+        
+        _dataDir = Path.Combine(AppContext.BaseDirectory, "data");
+        Directory.CreateDirectory(_dataDir);
 
-        // 2. Peer's manifest
-        var mfBody = await httpClient.GetStringAsync(
-            peerUrl.TrimEnd('/') + "/federation/manifest");
-        var mf = JObject.Parse(mfBody);
+        // Настройка SQLite
+        builder.Services.AddDbContext<SporelinkDbContext>(options =>
+            options.UseSqlite($"Data Source={Path.Combine(_dataDir, "sporelink.db")}"));
 
-        // 3. Verify signature
-        var signatures = mf["signatures"] as JArray;
-        if (signatures == null || signatures.Count == 0) return null;
-        var sigB64 = signatures[0]!["sig"]!.ToString();
+        var app = builder.Build();
 
-        var toSign = (JObject)mf.DeepClone();
-        toSign.Remove("signatures");
-        var canonical    = Canonicalize(toSign);
-        var signingInput = "SPORELINK-MANIFEST-V1\n" + canonical;
-
-        var peerPub = PublicKey.Import(
-            SignatureAlgorithm.Ed25519,
-            Convert.FromBase64String(peerPubKeyB64),
-            KeyBlobFormat.RawPublicKey);
-        var ok = SignatureAlgorithm.Ed25519.Verify(
-            peerPub,
-            Encoding.UTF8.GetBytes(signingInput),
-            Convert.FromBase64String(sigB64));
-        if (!ok) return null;
-
-        return mf;
-    }
-    catch
-    {
-        return null;
-    }
-}
-
-// Background refresh: no HTTP calls from request path → no deadlock.
-_ = Task.Run(async () =>
-{
-    while (true)
-    {
-        bool allOk = true;
-        foreach (var peer in peers)
+        // Инициализация БД
+        using (var scope = app.Services.CreateScope())
         {
-            var mf = await FetchPeerManifestAsync(peer);
-            if (mf != null)
-            {
-                lock (cacheLock) { peerCache[peer] = mf; }
+            var db = scope.ServiceProvider.GetRequiredService<SporelinkDbContext>();
+            db.Database.EnsureCreated();
+            SeedDatabase(db);
+        }
+
+        InitializeConfig();
+        InitializeKeys();
+        StartPeerGossip();
+
+        MapDiscoveryEndpoints(app);
+        MapAuthEndpoints(app);
+        MapReputationEndpoints(app);
+        MapSessionEndpoints(app);
+        MapTextureEndpoints(app);
+
+        app.Run();
+    }
+
+    // ─── Initialization ──────────────────────────────────────────────────
+    private static void InitializeConfig()
+    {
+        _serverId = Environment.GetEnvironmentVariable("SPORELINK_SERVER_ID") ?? "hub-0001";
+        _baseUrl  = Environment.GetEnvironmentVariable("SPORELINK_BASE_URL") ?? "http://localhost:5000";
+    }
+
+    private static void InitializeKeys()
+    {
+        // Ed25519 (для JWT и подписи манифестов)
+        var edKeyPath = Path.Combine(_dataDir, "ed25519.key");
+        if (!File.Exists(edKeyPath))
+        {
+            var k = Key.Create(SignatureAlgorithm.Ed25519, new KeyCreationParameters { ExportPolicy = KeyExportPolicies.AllowPlaintextExport });
+            File.WriteAllBytes(edKeyPath, k.Export(KeyBlobFormat.RawPrivateKey));
+            _signingKey = k;
+        }
+        else
+        {
+            _signingKey = Key.Import(SignatureAlgorithm.Ed25519, File.ReadAllBytes(edKeyPath), KeyBlobFormat.RawPrivateKey);
+        }
+        _publicKeyB64 = Convert.ToBase64String(_signingKey.PublicKey.Export(KeyBlobFormat.RawPublicKey));
+
+        // RSA (для подписи скинов в Minecraft)
+        var rsaKeyPath = Path.Combine(_dataDir, "rsa.key");
+        _rsaKey = RSA.Create();
+        if (File.Exists(rsaKeyPath))
+            _rsaKey.ImportRSAPrivateKey(File.ReadAllBytes(rsaKeyPath), out _);
+        else
+            File.WriteAllBytes(rsaKeyPath, _rsaKey.ExportRSAPrivateKey());
+    }
+
+    private static void SeedDatabase(SporelinkDbContext db)
+    {
+        if (db.Users.Any()) return;
+
+        db.Users.Add(new User
+        {
+            Username = "alice",
+            PasswordHash = BCrypt.Net.BCrypt.HashPassword("password"),
+            Uuid = "8f3a000000000000000000000000c2e1",
+            Reputation = 42,
+            Roles = "player,creator"
+        });
+        db.Users.Add(new User
+        {
+            Username = "bob",
+            PasswordHash = BCrypt.Net.BCrypt.HashPassword("password"),
+            Uuid = "a1b2000000000000000000000000c3d2",
+            Reputation = 0,
+            Roles = "player"
+        });
+        db.SaveChanges();
+    }
+
+    private static void StartPeerGossip()
+    {
+        var peersRaw = Environment.GetEnvironmentVariable("SPORELINK_PEERS") ?? "";
+        var peers = peersRaw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (peers.Length == 0) return;
+        
+        var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+        _ = Task.Run(async () => {
+            while (true) {
+                bool allOk = true;
+                foreach (var peer in peers) {
+                    var mf = await FetchPeerManifestAsync(httpClient, peer);
+                    if (mf != null) lock (CacheLock) { _peerCache[peer] = mf; }
+                    else allOk = false;
+                }
+                await Task.Delay(allOk ? TimeSpan.FromSeconds(15) : TimeSpan.FromSeconds(2));
             }
-            else
-            {
-                allOk = false;
-            }
-        }
-        await Task.Delay(allOk
-            ? TimeSpan.FromSeconds(15)
-            : TimeSpan.FromSeconds(2));
-    }
-});
-
-// ─── Discovery ───────────────────────────────────────────────────────
-app.MapGet("/.well-known/mc-federation", () => new
-{
-    protocol_version = "0.1",
-    server_id = serverId,
-    server_name = serverName,
-    auth_homeserver = baseUrl,
-    public_keys = new
-    {
-        server_signing_key = "ed25519:" + publicKeyB64,
-        auth_signing_key   = "ed25519:" + publicKeyB64
-    },
-    capabilities = new[] { "discovery", "manifest", "auth" }
-});
-
-// ─── Aggregated signed manifest ──────────────────────────────────────
-app.MapGet("/federation/manifest", () =>
-{
-    var membersById = new Dictionary<string, JObject>
-    {
-        [serverId] = new JObject
-        {
-            ["server_id"] = serverId,
-            ["endpoint"] = baseUrl,
-            ["public_key"] = "ed25519:" + publicKeyB64
-        }
-    };
-
-    // Add members from cached peer manifests (read-only, no HTTP)
-    lock (cacheLock)
-    {
-        foreach (var peerMf in peerCache.Values)
-        {
-            if (peerMf["members"] is not JArray arr) continue;
-            foreach (var m in arr)
-            {
-                var id = m!["server_id"]?.ToString();
-                if (string.IsNullOrEmpty(id)) continue;
-                if (!membersById.ContainsKey(id))
-                    membersById[id] = (JObject)m.DeepClone();
-            }
-        }
+        });
     }
 
-    var body = new JObject
+    // ─── Endpoints: Discovery & Federation ───────────────────────────────
+    private static void MapDiscoveryEndpoints(WebApplication app)
     {
-        ["manifest_version"] = "0.1",
-        ["federation_id"] = "sporelink",
-        ["issued_at"] = DateTime.UtcNow.ToString("O"),
-        ["members"] = new JArray(membersById.Values.ToArray()),
-        ["rules"] = new JObject
+        app.MapGet("/", () =>
         {
-            ["min_reputation_to_join"] = 0,
-            ["season_duration_days"] = 45
-        }
-    };
-
-    var canonical    = Canonicalize(body);
-    var signingInput = "SPORELINK-MANIFEST-V1\n" + canonical;
-    var sig = SignatureAlgorithm.Ed25519.Sign(
-        signingKey, Encoding.UTF8.GetBytes(signingInput));
-
-    body["signatures"] = new JArray
-    {
-        new JObject
-        {
-            ["signer"] = serverId,
-            ["sig"] = Convert.ToBase64String(sig)
-        }
-    };
-
-    return Results.Text(body.ToString(Formatting.None), "application/json");
-});
-
-// ─── Authentication ──────────────────────────────────────────────────
-app.MapPost("/authserver/authenticate", (LoginRequest req) =>
-{
-    if (!users.TryGetValue(req.Username, out var user))
-        return Results.Json(new { error = "ForbiddenOperationException",
-                                  errorMessage = "Invalid credentials" }, statusCode: 403);
-
-    var hash = Convert.ToHexString(
-        SHA256.HashData(Encoding.UTF8.GetBytes(req.Password)));
-    if (hash != user.PasswordHash)
-        return Results.Json(new { error = "ForbiddenOperationException",
-                                  errorMessage = "Invalid credentials" }, statusCode: 403);
-
-    var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-    var header  = new { alg = "EdDSA", typ = "JWT", kid = serverId };
-    var payload = new
-    {
-        iss = serverId,
-        sub = user.Uuid,
-        name = user.Name,
-        iat = now,
-        exp = now + 86400,
-        aud = "sporelink",
-        reputation = user.Reputation, 
-        roles = user.Roles,        
-        federation = "sporelink" 
-    };
-
-    var headerB64    = Base64UrlEncode(Stj.JsonSerializer.SerializeToUtf8Bytes(header));
-    var payloadB64   = Base64UrlEncode(Stj.JsonSerializer.SerializeToUtf8Bytes(payload));
-    var signingInput = headerB64 + "." + payloadB64;
-
-    var sig = SignatureAlgorithm.Ed25519.Sign(
-        authKey, Encoding.UTF8.GetBytes(signingInput));
-    var jwt = signingInput + "." + Base64UrlEncode(sig);
-
-    return Results.Json(new
-    {
-        accessToken = jwt,
-        clientToken = req.ClientToken ?? Guid.NewGuid().ToString("N"),
-        availableProfiles = new[] { new { id = user.Uuid, name = user.Name } },
-        selectedProfile = new { id = user.Uuid, name = user.Name }
-    });
-});
-
-// ─── Reputation: read ────────────────────────────────────────────────
-app.MapGet("/reputation/{playerId}", (string playerId) =>
-{
-    foreach (var kv in users)
-    {
-        if (kv.Value.Uuid == playerId)
-        {
+            var pubKeyBytes = _rsaKey.ExportSubjectPublicKeyInfo();
+            var pubKeyPem = "-----BEGIN PUBLIC KEY-----\n" +
+                            Convert.ToBase64String(pubKeyBytes, Base64FormattingOptions.InsertLineBreaks) +
+                            "\n-----END PUBLIC KEY-----";
             return Results.Json(new
             {
-                player_id  = playerId,
-                name       = kv.Value.Name,
-                reputation = kv.Value.Reputation,
-                roles      = kv.Value.Roles
+                meta = new { serverName = "Sporelink Hub", implementationName = "Sporelink", implementationVersion = "0.1.0" },
+                signaturePublickey = pubKeyPem,
+                skinDomains = new[] { "localhost", "127.0.0.1", "sporelink.ru" }
             });
-        }
-    }
-    return Results.NotFound(new { error = "player not found" });
-});
+        });
 
-// ─── Reputation: update (MVP, no auth) ───────────────────────────────
-app.MapPost("/reputation/{playerId}", (string playerId, ReputationUpdate req) =>
-{
-    string? key = null;
-    UserRecord? u = null;
-    foreach (var kv in users)
-    {
-        if (kv.Value.Uuid == playerId) { key = kv.Key; u = kv.Value; break; }
-    }
-    if (key == null || u == null)
-        return Results.NotFound(new { error = "player not found" });
-
-    int newRep = u.Reputation;
-    if (req.Delta.HasValue) newRep += req.Delta.Value;
-    if (req.Set.HasValue)   newRep = req.Set.Value;
-    newRep = Math.Clamp(newRep, -100, 100);
-
-    users[key] = u with { Reputation = newRep };
-
-    return Results.Json(new
-    {
-        player_id  = playerId,
-        reputation = newRep,
-        roles      = u.Roles
-    });
-});
-
-// ─── Admin: list all players (MVP) ───────────────────────────────────
-app.MapGet("/players", () =>
-    Results.Json(users.Values.Select(u => new
-    {
-        player_id  = u.Uuid,
-        name       = u.Name,
-        reputation = u.Reputation,
-        roles      = u.Roles
-    })));
-
-// ─── Authlib-injector Metadata ───────────────────────────────────────
-// Генерируем RSA-ключ для подписи скинов (authlib-injector требует его наличия)
-using var rsa = System.Security.Cryptography.RSA.Create(2048);
-var pubKeyBytes = rsa.ExportSubjectPublicKeyInfo();
-var pubKeyPem = "-----BEGIN PUBLIC KEY-----\n" + 
-                Convert.ToBase64String(pubKeyBytes, Base64FormattingOptions.InsertLineBreaks) + 
-                "\n-----END PUBLIC KEY-----";
-
-app.MapGet("/", () => Results.Json(new
-{
-    meta = new
-    {
-        serverName = "Sporelink Hub",
-        implementationName = "Sporelink",
-        implementationVersion = "0.1.0"
-    },
-    signaturePublickey = pubKeyPem,
-    skinDomains = new[] { "localhost", "sporelink.ru" }
-}));
-
-// ─── Session Server: join (клиент) ───────────────────────────────────
-app.MapPost("/sessionserver/session/minecraft/join", (JoinRequest req) =>
-{
-    // req.SelectedProfile содержит UUID. Нам нужно найти ник игрока по этому UUID.
-    var user = users.Values.FirstOrDefault(u => u.Uuid == req.SelectedProfile);
-    
-    if (user != null)
-    {
-        // Сохраняем НИК, чтобы сервер потом мог его проверить
-        joinedSessions[req.ServerId] = user.Name;
-        Console.WriteLine($"[session] Join: {user.Name} -> {req.ServerId}");
-        return Results.NoContent();
-    }
-    
-    Console.WriteLine($"[session] Join failed: unknown UUID {req.SelectedProfile}");
-    return Results.Json(new { error = "ForbiddenOperationException", errorMessage = "Invalid token" }, statusCode: 403);
-});
-
-// ─── Session Server: hasJoined (сервер) ──────────────────────────────
-app.MapGet("/sessionserver/session/minecraft/hasJoined", (string username, string serverId) =>
-{
-    if (joinedSessions.TryGetValue(serverId, out var joinedUser) && joinedUser == username)
-    {
-        var user = users.Values.FirstOrDefault(u => u.Name == username);
-        if (user != null)
+        app.MapGet("/.well-known/mc-federation", () => new
         {
-            // Сессия одноразовая — удаляем её после использования
-            joinedSessions.TryRemove(serverId, out _);
+            protocol_version = "0.1",
+            server_id = _serverId,
+            server_name = "Sporelink Hub",
+            auth_homeserver = _baseUrl,
+            public_keys = new
+            {
+                server_signing_key = "ed25519:" + _publicKeyB64,
+                auth_signing_key   = "ed25519:" + _publicKeyB64
+            },
+            capabilities = new[] { "discovery", "manifest", "auth" }
+        });
+
+        app.MapGet("/federation/manifest", () =>
+        {
+            var membersById = new Dictionary<string, JObject>
+            {
+                [_serverId] = new JObject
+                {
+                    ["server_id"] = _serverId,
+                    ["endpoint"] = _baseUrl,
+                    ["public_key"] = "ed25519:" + _publicKeyB64
+                }
+            };
+
+            lock (CacheLock)
+            {
+                foreach (var peerMf in _peerCache.Values)
+                {
+                    if (peerMf["members"] is not JArray arr) continue;
+                    foreach (var m in arr)
+                    {
+                        var id = m!["server_id"]?.ToString();
+                        if (string.IsNullOrEmpty(id)) continue;
+                        if (!membersById.ContainsKey(id))
+                            membersById[id] = (JObject)m.DeepClone();
+                    }
+                }
+            }
+
+            var body = new JObject
+            {
+                ["manifest_version"] = "0.1",
+                ["federation_id"] = "sporelink",
+                ["issued_at"] = DateTime.UtcNow.ToString("O"),
+                ["members"] = new JArray(membersById.Values.ToArray()),
+                ["rules"] = new JObject
+                {
+                    ["min_reputation_to_join"] = 0,
+                    ["season_duration_days"] = 45
+                }
+            };
+
+            var canonical    = Canonicalize(body);
+            var signingInput = "SPORELINK-MANIFEST-V1\n" + canonical;
+            var sig = SignatureAlgorithm.Ed25519.Sign(_signingKey, Encoding.UTF8.GetBytes(signingInput));
+
+            body["signatures"] = new JArray
+            {
+                new JObject { ["signer"] = _serverId, ["sig"] = Convert.ToBase64String(sig) }
+            };
+
+            return Results.Text(body.ToString(Formatting.None), "application/json");
+        });
+    }
+
+    // ─── Endpoints: Auth & Reputation ────────────────────────────────────
+    private static void MapAuthEndpoints(WebApplication app)
+    {
+        app.MapPost("/authserver/register", (RegisterRequest req, SporelinkDbContext db) =>
+        {
+            if (db.Users.Any(u => u.Username == req.Username))
+                return Results.BadRequest(new { error = "Username taken" });
+
+            var user = new User {
+                Username = req.Username,
+                PasswordHash = BCrypt.Net.BCrypt.HashPassword(req.Password),
+                Uuid = Guid.NewGuid().ToString("N"),
+                Reputation = 0,
+                Roles = "player"
+            };
+            db.Users.Add(user);
+            db.SaveChanges();
+            return Results.Ok(new { message = "Registered successfully", uuid = user.Uuid });
+        });
+
+        app.MapPost("/authserver/authenticate", (LoginRequest req, SporelinkDbContext db) =>
+        {
+            var user = db.Users.FirstOrDefault(u => u.Username == req.Username);
+            if (user == null || !BCrypt.Net.BCrypt.Verify(req.Password, user.PasswordHash))
+                return Results.Json(new { error = "ForbiddenOperationException", errorMessage = "Invalid credentials" }, statusCode: 403);
+
+            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var header  = new { alg = "EdDSA", typ = "JWT", kid = _serverId };
+            var payload = new {
+                iss = _serverId, sub = user.Uuid, name = user.Username,
+                iat = now, exp = now + 86400, aud = "sporelink",
+                reputation = user.Reputation, roles = user.Roles.Split(','), federation = "sporelink" 
+            };
+
+            var headerB64 = Base64UrlEncode(Stj.JsonSerializer.SerializeToUtf8Bytes(header));
+            var payloadB64 = Base64UrlEncode(Stj.JsonSerializer.SerializeToUtf8Bytes(payload));
+            var signingInput = headerB64 + "." + payloadB64;
+            var sig = SignatureAlgorithm.Ed25519.Sign(_signingKey, Encoding.UTF8.GetBytes(signingInput));
+            var jwt = signingInput + "." + Base64UrlEncode(sig);
+
+            return Results.Json(new {
+                accessToken = jwt,
+                clientToken = req.ClientToken ?? Guid.NewGuid().ToString("N"),
+                availableProfiles = new[] { new { id = user.Uuid, name = user.Username } },
+                selectedProfile = new { id = user.Uuid, name = user.Username }
+            });
+        });
+    }
+
+    private static void MapReputationEndpoints(WebApplication app)
+    {
+        app.MapGet("/reputation/{playerId}", (string playerId, SporelinkDbContext db) =>
+        {
+            var user = db.Users.FirstOrDefault(u => u.Uuid == playerId);
+            if (user == null) return Results.NotFound(new { error = "player not found" });
             
-            return Results.Json(new
+            return Results.Json(new { player_id = playerId, name = user.Username, reputation = user.Reputation, roles = user.Roles.Split(',') });
+        });
+
+        app.MapPost("/reputation/{playerId}", (string playerId, ReputationUpdate req, SporelinkDbContext db) =>
+        {
+            var user = db.Users.FirstOrDefault(u => u.Uuid == playerId);
+            if (user == null) return Results.NotFound(new { error = "player not found" });
+
+            int newRep = user.Reputation;
+            if (req.Delta.HasValue) newRep += req.Delta.Value;
+            if (req.Set.HasValue)   newRep = req.Set.Value;
+            user.Reputation = Math.Clamp(newRep, -100, 100);
+            
+            db.SaveChanges();
+            return Results.Json(new { player_id = playerId, reputation = user.Reputation, roles = user.Roles.Split(',') });
+        });
+
+        app.MapGet("/players", (SporelinkDbContext db) => Results.Json(db.Users.Select(u => new
+        {
+            player_id = u.Uuid, name = u.Username, reputation = u.Reputation, roles = u.Roles.Split(',')
+        }).ToList()));
+    }
+
+    // ─── Endpoints: Session & Minecraft ──────────────────────────────────
+    private static void MapSessionEndpoints(WebApplication app)
+    {
+        app.MapPost("/sessionserver/session/minecraft/join", (JoinRequest req, SporelinkDbContext db) =>
+        {
+            var user = db.Users.FirstOrDefault(u => u.Uuid == req.SelectedProfile);
+            if (user == null)
             {
-                id = user.Uuid,
-                name = user.Name,
-                properties = new object[] { } // Скины добавим позже
-            });
+                Console.WriteLine($"[session] Join failed: unknown UUID {req.SelectedProfile}");
+                return Results.Json(new { error = "ForbiddenOperationException", errorMessage = "Invalid token" }, statusCode: 403);
+            }
+            
+            _joinedSessions[req.ServerId] = user.Username;
+            Console.WriteLine($"[session] Join: {user.Username} -> {req.ServerId}");
+            return Results.NoContent();
+        });
+
+        app.MapGet("/sessionserver/session/minecraft/hasJoined", (string username, string serverId, SporelinkDbContext db) =>
+        {
+            if (_joinedSessions.TryGetValue(serverId, out var joinedUser) && joinedUser == username)
+            {
+                var user = db.Users.FirstOrDefault(u => u.Username == username);
+                if (user != null)
+                {
+                    _joinedSessions.TryRemove(serverId, out _);
+                    return Results.Json(new { id = user.Uuid, name = user.Username, properties = new object[] { } });
+                }
+            }
+            return Results.NotFound();
+        });
+
+        app.MapGet("/sessionserver/session/minecraft/profile/{uuid}", (string uuid, bool unsigned, SporelinkDbContext db) =>
+        {
+            string cleanUuid = uuid.Replace("-", "");
+            var user = db.Users.FirstOrDefault(u => u.Uuid == cleanUuid);
+            if (user == null) return Results.NotFound();
+
+            var textures = new Dictionary<string, object>();
+            if (!string.IsNullOrEmpty(user.SkinHash))
+                textures["SKIN"] = new { url = $"{_baseUrl}/textures/{user.SkinHash}", metadata = new { model = user.SkinModel ?? "classic" } };
+            if (!string.IsNullOrEmpty(user.CapeHash))
+                textures["CAPE"] = new { url = $"{_baseUrl}/textures/{user.CapeHash}" };
+
+            string? texturesValue = null;
+            string? texturesSignature = null;
+
+            if (textures.Count > 0)
+            {
+                var payload = new { timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), profileId = cleanUuid, profileName = user.Username, textures = textures };
+                string json = JsonConvert.SerializeObject(payload, Formatting.None);
+                texturesValue = Convert.ToBase64String(Encoding.UTF8.GetBytes(json));
+
+                if (!unsigned)
+                    texturesSignature = Convert.ToBase64String(_rsaKey.SignData(Encoding.UTF8.GetBytes(texturesValue), HashAlgorithmName.SHA1, RSASignaturePadding.Pkcs1));
+            }
+
+            var props = new List<object>();
+            if (texturesValue != null) {
+                var prop = new Dictionary<string, object> { ["name"] = "textures", ["value"] = texturesValue };
+                if (texturesSignature != null) prop["signature"] = texturesSignature;
+                props.Add(prop);
+            }
+
+            return Results.Json(new { id = cleanUuid, name = user.Username, properties = props });
+        });
+    }
+
+    // ─── Endpoints: Textures ─────────────────────────────────────────────
+    private static void MapTextureEndpoints(WebApplication app)
+    {
+        app.MapPut("/api/user/profile/{uuid}/{textureType}", async (string uuid, string textureType, HttpRequest req, SporelinkDbContext db) =>
+        {
+            string? authUuid = GetUuidFromAuth(req);
+            if (authUuid == null || authUuid != uuid) return Results.Unauthorized();
+
+            var form = await req.ReadFormAsync();
+            var file = form.Files.GetFile("file");
+            if (file == null || file.Length == 0) return Results.BadRequest(new { error = "No file provided" });
+
+            using var ms = new MemoryStream();
+            await file.CopyToAsync(ms);
+            var bytes = ms.ToArray();
+            string hash = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+            string filePath = Path.Combine(_dataDir, $"{hash}.png");
+            
+            await File.WriteAllBytesAsync(filePath, bytes);
+
+            var user = db.Users.FirstOrDefault(u => u.Uuid == uuid);
+            if (user != null)
+            {
+                if (textureType == "skin") {
+                    user.SkinHash = hash;
+                    user.SkinModel = form["model"].ToString() == "slim" ? "slim" : "classic";
+                } else if (textureType == "cape") {
+                    user.CapeHash = hash;
+                }
+                db.SaveChanges();
+            }
+
+            return Results.NoContent();
+        });
+
+        app.MapDelete("/api/user/profile/{uuid}/{textureType}", (string uuid, string textureType, HttpRequest req, SporelinkDbContext db) =>
+        {
+            string? authUuid = GetUuidFromAuth(req);
+            if (authUuid == null || authUuid != uuid) return Results.Unauthorized();
+
+            var user = db.Users.FirstOrDefault(u => u.Uuid == uuid);
+            if (user != null)
+            {
+                if (textureType == "skin") user.SkinHash = null;
+                else if (textureType == "cape") user.CapeHash = null;
+                db.SaveChanges();
+            }
+            return Results.NoContent();
+        });
+
+        app.MapGet("/textures/{hash}", (string hash) =>
+        {
+            string filePath = Path.Combine(_dataDir, $"{hash}.png");
+            if (!File.Exists(filePath)) return Results.NotFound();
+            return Results.File(filePath, "image/png");
+        });
+    }
+
+    // ─── Background Helpers ──────────────────────────────────────────────
+    private static async Task<JObject?> FetchPeerManifestAsync(HttpClient client, string peerUrl)
+    {
+        try
+        {
+            var wkBody = await client.GetStringAsync(peerUrl.TrimEnd('/') + "/.well-known/mc-federation");
+            var wk = JObject.Parse(wkBody);
+            var peerPubKeyB64 = wk["public_keys"]!["server_signing_key"]!.ToString().Replace("ed25519:", "");
+
+            var mfBody = await client.GetStringAsync(peerUrl.TrimEnd('/') + "/federation/manifest");
+            var mf = JObject.Parse(mfBody);
+
+            var signatures = mf["signatures"] as JArray;
+            if (signatures == null || signatures.Count == 0) return null;
+            var sigB64 = signatures[0]!["sig"]!.ToString();
+
+            var toSign = (JObject)mf.DeepClone();
+            toSign.Remove("signatures");
+            var canonical    = Canonicalize(toSign);
+            var signingInput = "SPORELINK-MANIFEST-V1\n" + canonical;
+
+            var peerPub = PublicKey.Import(SignatureAlgorithm.Ed25519, Convert.FromBase64String(peerPubKeyB64), KeyBlobFormat.RawPublicKey);
+            var ok = SignatureAlgorithm.Ed25519.Verify(peerPub, Encoding.UTF8.GetBytes(signingInput), Convert.FromBase64String(sigB64));
+            
+            return ok ? mf : null;
         }
-    }
-    return Results.NotFound();
-});
-
-// ─── Session Server: profile (скины) ─────────────────────────────────
-app.MapGet("/sessionserver/session/minecraft/profile/{uuid}", (string uuid) =>
-{
-    // Убираем дефисы, если они есть, чтобы сравнить с нашим форматом
-    string cleanUuid = uuid.Replace("-", "");
-    var user = users.Values.FirstOrDefault(u => u.Uuid == cleanUuid);
-    
-    if (user == null)
-    {
-        return Results.NotFound();
+        catch { return null; }
     }
 
-    return Results.Json(new
+    // ─── Crypto & Auth Helpers ───────────────────────────────────────────
+    private static string? GetUuidFromAuth(HttpRequest req)
     {
-        id = user.Uuid,
-        name = user.Name,
-        // Пока возвращаем пустой массив (без скинов). 
-        // Позже сюда можно добавить Base64-строку с URL скина.
-        properties = new object[] { } 
-    });
-});
+        string? authHeader = req.Headers["Authorization"];
+        if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer ")) return null;
+        
+        string jwt = authHeader.Substring(7);
+        try
+        {
+            string[] parts = jwt.Split('.');
+            if (parts.Length != 3) return null;
+            
+            byte[] sig = Base64UrlDecode(parts[2]);
+            string signingInput = parts[0] + "." + parts[1];
+            var pub = PublicKey.Import(SignatureAlgorithm.Ed25519, Convert.FromBase64String(_publicKeyB64), KeyBlobFormat.RawPublicKey);
+            if (!SignatureAlgorithm.Ed25519.Verify(pub, Encoding.UTF8.GetBytes(signingInput), sig)) return null;
 
-app.Run();
+            string payloadJson = Encoding.UTF8.GetString(Base64UrlDecode(parts[1]));
+            var payload = JObject.Parse(payloadJson);
+            return payload["sub"]?.ToString();
+        }
+        catch { return null; }
+    }
 
-// ─── Helpers ─────────────────────────────────────────────────────────
-static string Canonicalize(JToken token) =>
-    token switch
+    private static string Canonicalize(JToken token) =>
+        token switch
+        {
+            JObject obj =>
+                "{" + string.Join(",", obj.Properties()
+                    .OrderBy(p => p.Name, StringComparer.Ordinal)
+                    .Select(p => JsonConvert.ToString(p.Name) + ":" + Canonicalize(p.Value)))
+                + "}",
+            JArray arr => "[" + string.Join(",", arr.Select(Canonicalize)) + "]",
+            _ => token.ToString(Formatting.None)
+        };
+
+    private static string Base64UrlEncode(byte[] bytes) =>
+        Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+    private static byte[] Base64UrlDecode(string input)
     {
-        JObject obj =>
-            "{" + string.Join(",", obj.Properties()
-                .OrderBy(p => p.Name, StringComparer.Ordinal)
-                .Select(p => JsonConvert.ToString(p.Name) + ":" + Canonicalize(p.Value)))
-            + "}",
-        JArray arr =>
-            "[" + string.Join(",", arr.Select(Canonicalize)) + "]",
-        _ => token.ToString(Formatting.None)
-    };
+        string padded = input.Replace('-', '+').Replace('_', '/');
+        switch (padded.Length % 4)
+        {
+            case 2: padded += "=="; break;
+            case 3: padded += "="; break;
+        }
+        return Convert.FromBase64String(padded);
+    }
+}
 
-static string Base64UrlEncode(byte[] bytes) =>
-    Convert.ToBase64String(bytes)
-        .TrimEnd('=')
-        .Replace('+', '-')
-        .Replace('/', '_');
-
+// ─── DTOs ────────────────────────────────────────────────────────────────
 internal record LoginRequest(string Username, string Password, string? ClientToken);
-record UserRecord(string PasswordHash, string Uuid, string Name, int Reputation, string[] Roles);
+internal record RegisterRequest(string Username, string Password);
 internal record ReputationUpdate(int? Delta, int? Set);
 internal record JoinRequest(string AccessToken, string SelectedProfile, string ServerId);

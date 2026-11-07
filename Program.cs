@@ -35,6 +35,8 @@ var users = new Dictionary<string, UserRecord>
         new[] { "player", "creator" }
     )
 };
+// Хранилище активных сессий: serverId -> username
+var joinedSessions = new System.Collections.Concurrent.ConcurrentDictionary<string, string>();
 if (serverId == "hub-0002")
 {
     users["bob"] = new UserRecord(
@@ -238,6 +240,144 @@ app.MapPost("/authserver/authenticate", (LoginRequest req) =>
     });
 });
 
+// ─── Reputation: read ────────────────────────────────────────────────
+app.MapGet("/reputation/{playerId}", (string playerId) =>
+{
+    foreach (var kv in users)
+    {
+        if (kv.Value.Uuid == playerId)
+        {
+            return Results.Json(new
+            {
+                player_id  = playerId,
+                name       = kv.Value.Name,
+                reputation = kv.Value.Reputation,
+                roles      = kv.Value.Roles
+            });
+        }
+    }
+    return Results.NotFound(new { error = "player not found" });
+});
+
+// ─── Reputation: update (MVP, no auth) ───────────────────────────────
+app.MapPost("/reputation/{playerId}", (string playerId, ReputationUpdate req) =>
+{
+    string? key = null;
+    UserRecord? u = null;
+    foreach (var kv in users)
+    {
+        if (kv.Value.Uuid == playerId) { key = kv.Key; u = kv.Value; break; }
+    }
+    if (key == null || u == null)
+        return Results.NotFound(new { error = "player not found" });
+
+    int newRep = u.Reputation;
+    if (req.Delta.HasValue) newRep += req.Delta.Value;
+    if (req.Set.HasValue)   newRep = req.Set.Value;
+    newRep = Math.Clamp(newRep, -100, 100);
+
+    users[key] = u with { Reputation = newRep };
+
+    return Results.Json(new
+    {
+        player_id  = playerId,
+        reputation = newRep,
+        roles      = u.Roles
+    });
+});
+
+// ─── Admin: list all players (MVP) ───────────────────────────────────
+app.MapGet("/players", () =>
+    Results.Json(users.Values.Select(u => new
+    {
+        player_id  = u.Uuid,
+        name       = u.Name,
+        reputation = u.Reputation,
+        roles      = u.Roles
+    })));
+
+// ─── Authlib-injector Metadata ───────────────────────────────────────
+// Генерируем RSA-ключ для подписи скинов (authlib-injector требует его наличия)
+using var rsa = System.Security.Cryptography.RSA.Create(2048);
+var pubKeyBytes = rsa.ExportSubjectPublicKeyInfo();
+var pubKeyPem = "-----BEGIN PUBLIC KEY-----\n" + 
+                Convert.ToBase64String(pubKeyBytes, Base64FormattingOptions.InsertLineBreaks) + 
+                "\n-----END PUBLIC KEY-----";
+
+app.MapGet("/", () => Results.Json(new
+{
+    meta = new
+    {
+        serverName = "Sporelink Hub",
+        implementationName = "Sporelink",
+        implementationVersion = "0.1.0"
+    },
+    signaturePublickey = pubKeyPem,
+    skinDomains = new[] { "localhost", "sporelink.ru" }
+}));
+
+// ─── Session Server: join (клиент) ───────────────────────────────────
+app.MapPost("/sessionserver/session/minecraft/join", (JoinRequest req) =>
+{
+    // req.SelectedProfile содержит UUID. Нам нужно найти ник игрока по этому UUID.
+    var user = users.Values.FirstOrDefault(u => u.Uuid == req.SelectedProfile);
+    
+    if (user != null)
+    {
+        // Сохраняем НИК, чтобы сервер потом мог его проверить
+        joinedSessions[req.ServerId] = user.Name;
+        Console.WriteLine($"[session] Join: {user.Name} -> {req.ServerId}");
+        return Results.NoContent();
+    }
+    
+    Console.WriteLine($"[session] Join failed: unknown UUID {req.SelectedProfile}");
+    return Results.Json(new { error = "ForbiddenOperationException", errorMessage = "Invalid token" }, statusCode: 403);
+});
+
+// ─── Session Server: hasJoined (сервер) ──────────────────────────────
+app.MapGet("/sessionserver/session/minecraft/hasJoined", (string username, string serverId) =>
+{
+    if (joinedSessions.TryGetValue(serverId, out var joinedUser) && joinedUser == username)
+    {
+        var user = users.Values.FirstOrDefault(u => u.Name == username);
+        if (user != null)
+        {
+            // Сессия одноразовая — удаляем её после использования
+            joinedSessions.TryRemove(serverId, out _);
+            
+            return Results.Json(new
+            {
+                id = user.Uuid,
+                name = user.Name,
+                properties = new object[] { } // Скины добавим позже
+            });
+        }
+    }
+    return Results.NotFound();
+});
+
+// ─── Session Server: profile (скины) ─────────────────────────────────
+app.MapGet("/sessionserver/session/minecraft/profile/{uuid}", (string uuid) =>
+{
+    // Убираем дефисы, если они есть, чтобы сравнить с нашим форматом
+    string cleanUuid = uuid.Replace("-", "");
+    var user = users.Values.FirstOrDefault(u => u.Uuid == cleanUuid);
+    
+    if (user == null)
+    {
+        return Results.NotFound();
+    }
+
+    return Results.Json(new
+    {
+        id = user.Uuid,
+        name = user.Name,
+        // Пока возвращаем пустой массив (без скинов). 
+        // Позже сюда можно добавить Base64-строку с URL скина.
+        properties = new object[] { } 
+    });
+});
+
 app.Run();
 
 // ─── Helpers ─────────────────────────────────────────────────────────
@@ -262,3 +402,5 @@ static string Base64UrlEncode(byte[] bytes) =>
 
 internal record LoginRequest(string Username, string Password, string? ClientToken);
 record UserRecord(string PasswordHash, string Uuid, string Name, int Reputation, string[] Roles);
+internal record ReputationUpdate(int? Delta, int? Set);
+internal record JoinRequest(string AccessToken, string SelectedProfile, string ServerId);

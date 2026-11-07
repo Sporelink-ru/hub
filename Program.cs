@@ -24,21 +24,25 @@ var publicKeyB64 = Convert.ToBase64String(
     signingKey.PublicKey.Export(KeyBlobFormat.RawPublicKey));
 var authKey = signingKey;
 
-// ─── Users ───────────────────────────────────────────────────────────
-var users = new Dictionary<string, (string PasswordHash, string Uuid, string Name)>
+// ─── Users with reputation and roles ─────────────────────────────────
+var users = new Dictionary<string, UserRecord>
 {
-    ["alice"] = (
+    ["alice"] = new UserRecord(
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("password"))),
         "8f3a000000000000000000000000c2e1",
-        "Alice"
+        "Alice",
+        42,
+        new[] { "player", "creator" }
     )
 };
 if (serverId == "hub-0002")
 {
-    users["bob"] = (
+    users["bob"] = new UserRecord(
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("password"))),
         "a1b2000000000000000000000000c3d2",
-        "Bob"
+        "Bob",
+        -5,
+        new[] { "player" }
     );
 }
 
@@ -211,7 +215,10 @@ app.MapPost("/authserver/authenticate", (LoginRequest req) =>
         name = user.Name,
         iat = now,
         exp = now + 86400,
-        aud = "sporelink"
+        aud = "sporelink",
+        reputation = user.Reputation, 
+        roles = user.Roles,        
+        federation = "sporelink" 
     };
 
     var headerB64    = Base64UrlEncode(Stj.JsonSerializer.SerializeToUtf8Bytes(header));
@@ -254,3 +261,4 @@ static string Base64UrlEncode(byte[] bytes) =>
         .Replace('/', '_');
 
 internal record LoginRequest(string Username, string Password, string? ClientToken);
+record UserRecord(string PasswordHash, string Uuid, string Name, int Reputation, string[] Roles);

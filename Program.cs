@@ -33,9 +33,11 @@ public class Program
         _dataDir = Path.Combine(AppContext.BaseDirectory, "data");
         Directory.CreateDirectory(_dataDir);
 
-        // Настройка SQLite
+        var connString = Environment.GetEnvironmentVariable("DB_CONNECTION_STRING") 
+            ?? "Host=localhost;Database=sporelink_db;Username=sporelink;Password=sporelink_secret";
+
         builder.Services.AddDbContext<SporelinkDbContext>(options =>
-            options.UseSqlite($"Data Source={Path.Combine(_dataDir, "sporelink.db")}"));
+            options.UseNpgsql(connString));
 
         var app = builder.Build();
 
@@ -56,6 +58,7 @@ public class Program
         MapReputationEndpoints(app);
         MapSessionEndpoints(app);
         MapTextureEndpoints(app);
+        MapAdminEndpoints(app);
 
         app.Run();
     }
@@ -111,6 +114,14 @@ public class Program
             Uuid = "a1b2000000000000000000000000c3d2",
             Reputation = 0,
             Roles = "player"
+        });
+        db.Users.Add(new User
+        {
+            Username = "ceo",
+            PasswordHash = BCrypt.Net.BCrypt.HashPassword("ceo"),
+            Uuid = "00000000000000000000000000000000",
+            Reputation = 100,
+            Roles = "player,ceo"
         });
         db.SaveChanges();
     }
@@ -225,10 +236,14 @@ public class Program
         app.MapPost("/authserver/register", (RegisterRequest req, SporelinkDbContext db) =>
         {
             if (db.Users.Any(u => u.Username == req.Username))
-                return Results.BadRequest(new { error = "Username taken" });
+                return Results.BadRequest(new { error = "Username already taken" });
+                
+            if (db.Users.Any(u => u.Email == req.Email))
+                return Results.BadRequest(new { error = "Email already registered" });
 
             var user = new User {
                 Username = req.Username,
+                Email = req.Email, // <--- Сохраняем Email
                 PasswordHash = BCrypt.Net.BCrypt.HashPassword(req.Password),
                 Uuid = Guid.NewGuid().ToString("N"),
                 Reputation = 0,
@@ -329,7 +344,7 @@ public class Program
             return Results.NotFound();
         });
 
-        app.MapGet("/sessionserver/session/minecraft/profile/{uuid}", (string uuid, bool unsigned, SporelinkDbContext db) =>
+        app.MapGet("/sessionserver/session/minecraft/profile/{uuid}", (string uuid, SporelinkDbContext db, bool unsigned = false) =>
         {
             string cleanUuid = uuid.Replace("-", "");
             var user = db.Users.FirstOrDefault(u => u.Uuid == cleanUuid);
@@ -423,6 +438,66 @@ public class Program
         });
     }
 
+    // ─── Endpoints: Admin ────────────────────────────────────────────────
+    private static void MapAdminEndpoints(WebApplication app)
+    {
+        // Получить список всех игроков
+        app.MapGet("/admin/users", (HttpRequest req, SporelinkDbContext db) =>
+        {
+            if (!HasRole(req, "admin", db)) return Results.Unauthorized();
+
+            return Results.Json(db.Users.Select(u => new
+            {
+                uuid = u.Uuid,
+                username = u.Username,
+                email = u.Email,
+                reputation = u.Reputation,
+                roles = u.Roles.Split(',')
+            }).ToList());
+        });
+
+        // Изменить роль игрока
+        app.MapPost("/admin/users/{uuid}/role", (string uuid, RoleUpdate body, HttpRequest req, SporelinkDbContext db) =>
+        {
+            if (!HasRole(req, "admin", db)) return Results.Unauthorized();
+
+            var targetUser = db.Users.FirstOrDefault(u => u.Uuid == uuid);
+            if (targetUser == null) return Results.NotFound(new { error = "User not found" });
+
+            // Защита: нельзя понизить/повысить CEO'в, если ты не CEO
+            bool isCeo = HasRole(req, "ceo", db);
+            if ((targetUser.Roles.Contains("ceo") || body.Role == "ceo") && !isCeo)
+                return Results.Json(new { error = "Only CEO can manage CEO roles" }, statusCode: 403);
+
+            // Формируем новую строку ролей
+            if (body.Role == "player")
+                targetUser.Roles = "player"; // Сбрасываем всё до игрока
+            else if (!targetUser.Roles.Contains(body.Role))
+                targetUser.Roles = targetUser.Roles + "," + body.Role; // Добавляем роль
+
+            db.SaveChanges();
+            return Results.Ok(new { message = "Role updated", roles = targetUser.Roles.Split(',') });
+        });
+    }
+
+    // Хелпер для проверки ролей
+    private static bool HasRole(HttpRequest req, string requiredRole, SporelinkDbContext db)
+    {
+        var uuid = GetUuidFromAuth(req);
+        if (uuid == null) return false;
+
+        var user = db.Users.FirstOrDefault(u => u.Uuid == uuid);
+        if (user == null) return false;
+
+        var roles = user.Roles.Split(',').Select(r => r.Trim()).ToList();
+        
+        if (roles.Contains("ceo")) return true; // CEO может всё
+        if (requiredRole == "admin" && roles.Contains("admin")) return true;
+        if (requiredRole == "moderator" && (roles.Contains("moderator") || roles.Contains("admin"))) return true;
+        
+        return false;
+    }
+
     // ─── Background Helpers ──────────────────────────────────────────────
     private static async Task<JObject?> FetchPeerManifestAsync(HttpClient client, string peerUrl)
     {
@@ -505,6 +580,7 @@ public class Program
 
 // ─── DTOs ────────────────────────────────────────────────────────────────
 internal record LoginRequest(string Username, string Password, string? ClientToken);
-internal record RegisterRequest(string Username, string Password);
+internal record RegisterRequest(string Username, string Password, string Email);
 internal record ReputationUpdate(int? Delta, int? Set);
 internal record JoinRequest(string AccessToken, string SelectedProfile, string ServerId);
+internal record RoleUpdate(string Role);

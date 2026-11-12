@@ -7,6 +7,8 @@ public class SporelinkDbContext : DbContext
 {
     public DbSet<User> Users { get; set; }
 
+    public DbSet<AuctionItem> Auctions { get; set; }
+
     public SporelinkDbContext(DbContextOptions<SporelinkDbContext> options) : base(options) { }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)

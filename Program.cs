@@ -59,6 +59,8 @@ public class Program
         MapSessionEndpoints(app);
         MapTextureEndpoints(app);
         MapAdminEndpoints(app);
+        MapNewsEndpoints(app);
+        MapAuctionEndpoints(app);
 
         app.Run();
     }
@@ -527,6 +529,89 @@ public class Program
         catch { return null; }
     }
 
+    // ─── News API ────────────────────────────────────────────────────────
+    private static void MapNewsEndpoints(WebApplication app)
+    {
+        app.MapGet("/api/news", () =>
+        {
+            // В реальном проекте вы можете читать это из файла или БД
+            var news = new[]
+            {
+                new { 
+                    id = 1, 
+                    title = "Добро пожаловать в Sporelink!", 
+                    content = "Мы рады приветствовать вас в нашей новой федеративной сети. Присоединяйтесь к серверам, зарабатывайте монеты и общайтесь!", 
+                    date = "2026-11-12" 
+                },
+                new { 
+                    id = 2, 
+                    title = "Обновление: Магазин и Плащи", 
+                    content = "Теперь вы можете покупать предметы за внутриигровую валюту в /shop и загружать свои плащи прямо в лаунчере!", 
+                    date = "2026-11-12" 
+                }
+            };
+            
+            return Results.Json(news);
+        });
+    }
+
+    // ─── Auction API ─────────────────────────────────────────────────────
+    private static void MapAuctionEndpoints(WebApplication app)
+    {
+        // Получить все активные лоты
+        app.MapGet("/api/auction", (SporelinkDbContext db) =>
+        {
+            var lots = db.Auctions.Where(a => !a.IsSold)
+                .OrderByDescending(a => a.Id)
+                .Select(a => new { 
+                    a.Id, 
+                    a.SellerUuid,
+                    a.SellerName, 
+                    a.ItemBase64, 
+                    a.Price 
+                })
+                .ToList();
+            return Results.Json(lots);
+        });
+
+        // Выставить предмет на аукцион
+        app.MapPost("/api/auction", (AuctionCreate req, SporelinkDbContext db) =>
+        {
+            var user = db.Users.FirstOrDefault(u => u.Uuid == req.SellerUuid);
+            if (user == null) return Results.Unauthorized();
+
+            var lot = new AuctionItem
+            {
+                SellerUuid = req.SellerUuid,
+                SellerName = user.Username,
+                ItemBase64 = req.ItemBase64,
+                Price = req.Price
+            };
+            db.Auctions.Add(lot);
+            db.SaveChanges();
+            return Results.Ok(new { message = "Item listed", lotId = lot.Id });
+        });
+
+        // Купить предмет
+        app.MapPost("/api/auction/{id}/buy", (int id, BuyRequest req, SporelinkDbContext db) =>
+        {
+            var lot = db.Auctions.FirstOrDefault(a => a.Id == id && !a.IsSold);
+            if (lot == null) return Results.BadRequest(new { error = "Lot not found or already sold" });
+
+            // Защита: нельзя купить свой же предмет
+            if (lot.SellerUuid == req.BuyerUuid) return Results.BadRequest(new { error = "You cannot buy your own item" });
+
+            lot.IsSold = true;
+            lot.BuyerUuid = req.BuyerUuid;
+            db.SaveChanges();
+
+            // TODO: Здесь мы должны вызвать Node, чтобы перевести деньги от покупателя к продавцу.
+            // Но для простоты MVP мы сделаем это на стороне плагина, который вызовет /transfer.
+
+            return Results.Ok(new { message = "Item bought", itemBase64 = lot.ItemBase64 });
+        });
+    }
+
     // ─── Crypto & Auth Helpers ───────────────────────────────────────────
     private static string? GetUuidFromAuth(HttpRequest req)
     {
@@ -584,3 +669,5 @@ internal record RegisterRequest(string Username, string Password, string Email);
 internal record ReputationUpdate(int? Delta, int? Set);
 internal record JoinRequest(string AccessToken, string SelectedProfile, string ServerId);
 internal record RoleUpdate(string Role);
+internal record AuctionCreate(string SellerUuid, string ItemBase64, long Price);
+internal record BuyRequest(string BuyerUuid);
